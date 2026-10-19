@@ -1,0 +1,29 @@
+services:
+  - type: web
+    name: asvm-dialogue-extractor
+    runtime: docker
+    plan: starter
+    healthCheckPath: /
+    envVars:
+      - key: BOT_TOKEN
+        sync: false
+      - key: API_ID
+        sync: false
+      - key: API_HASH
+        sync: false
+      - key: YT_API
+        sync: false
+      - key: PUBLIC_BASE_URL
+        sync: false
+      - key: WEBHOOK_SECRET
+        generateValue: true
+      - key: WHISPER_MODEL
+        value: small
+      - key: WHISPER_DEVICE
+        value: cpu
+      - key: WHISPER_COMPUTE_TYPE
+        value: int8
+      - key: MAX_UPLOAD_MB
+        value: "19"
+      - key: ADMIN_IDS
+        value: ""
