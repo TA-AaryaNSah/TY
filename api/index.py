@@ -3,28 +3,34 @@ import re
 import json
 import shutil
 import tempfile
-import subprocess
 from urllib.parse import urlparse, parse_qs
 from http.server import BaseHTTPRequestHandler
 
 import yt_dlp
+import imageio_ffmpeg
 
 
-def validate_url(url):
+def validate_youtube_url(url):
     try:
         parsed = urlparse(url)
         host = (parsed.hostname or "").lower()
 
         if host in ("youtube.com", "www.youtube.com", "m.youtube.com"):
             video_id = parse_qs(parsed.query).get("v", [""])[0]
+
         elif host == "youtu.be":
             video_id = parsed.path.strip("/")
-        else:
-            return False
 
-        return bool(re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id))
+        else:
+            return None
+
+        if re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
+            return video_id
+
+        return None
+
     except Exception:
-        return False
+        return None
 
 
 class handler(BaseHTTPRequestHandler):
@@ -36,31 +42,28 @@ class handler(BaseHTTPRequestHandler):
         if not url:
             return self.send_json(400, {
                 "success": False,
-                "error": "Missing url parameter",
-                "usage": "/api?url=YOUR_YOUTUBE_URL"
+                "error": "Missing URL parameter",
+                "usage": "/api?url=https://www.youtube.com/watch?v=VIDEO_ID"
             })
 
-        if not validate_url(url):
+        video_id = validate_youtube_url(url)
+
+        if not video_id:
             return self.send_json(400, {
                 "success": False,
                 "error": "Invalid YouTube URL"
             })
 
-        # Check that FFmpeg is available in the deployment.
-        if not shutil.which("ffmpeg"):
-            return self.send_json(503, {
-                "success": False,
-                "error": "FFmpeg is not available in this deployment.",
-                "details": (
-                    "Vercel must have a compatible FFmpeg binary "
-                    "before audio conversion can work."
-                )
-            })
-
         temp_dir = tempfile.mkdtemp(prefix="ytmp3_")
 
         try:
-            output_template = os.path.join(temp_dir, "audio.%(ext)s")
+            # Locate FFmpeg bundled by imageio-ffmpeg.
+            ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+
+            output_template = os.path.join(
+                temp_dir,
+                "audio.%(ext)s"
+            )
 
             options = {
                 "format": "bestaudio/best",
@@ -70,14 +73,17 @@ class handler(BaseHTTPRequestHandler):
                 "no_warnings": True,
                 "socket_timeout": 15,
                 "retries": 1,
-                "overwrites": True,
-                "postprocessors": [{
-                    "key": "FFmpegExtractAudio",
-                    "preferredcodec": "mp3",
-                    "preferredquality": "192",
-                }],
+                "ffmpeg_location": ffmpeg_path,
+                "postprocessors": [
+                    {
+                        "key": "FFmpegExtractAudio",
+                        "preferredcodec": "mp3",
+                        "preferredquality": "192"
+                    }
+                ]
             }
 
+            # Download and convert audio.
             with yt_dlp.YoutubeDL(options) as downloader:
                 downloader.download([url])
 
@@ -86,46 +92,48 @@ class handler(BaseHTTPRequestHandler):
             if not os.path.isfile(mp3_path):
                 return self.send_json(500, {
                     "success": False,
-                    "error": "MP3 conversion did not produce an output file."
+                    "error": "MP3 file was not generated"
                 })
 
-            # Serverless response limits make streaming large files
-            # directly from a temporary file unreliable.
             file_size = os.path.getsize(mp3_path)
 
+            # Conservative response-size limit.
             if file_size > 4 * 1024 * 1024:
                 return self.send_json(413, {
                     "success": False,
-                    "error": "MP3 exceeds the configured response-size limit.",
+                    "error": "MP3 exceeds the 4 MiB response limit",
                     "file_size_bytes": file_size,
-                    "suggestion": (
-                        "Use a compatible audio-processing service "
-                        "for larger files."
+                    "message": (
+                        "Vercel response and execution limits may "
+                        "prevent larger downloads."
                     )
                 })
 
             with open(mp3_path, "rb") as audio_file:
                 audio_data = audio_file.read()
 
+            # Return the MP3 as a downloadable attachment.
             self.send_response(200)
             self.send_header("Content-Type", "audio/mpeg")
             self.send_header(
                 "Content-Disposition",
                 'attachment; filename="audio.mp3"'
             )
-            self.send_header("Content-Length", str(len(audio_data)))
+            self.send_header(
+                "Content-Length",
+                str(len(audio_data))
+            )
             self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(audio_data)
 
-        except Exception:
+        except Exception as error:
+            print("YouTube MP3 error:", repr(error))
+
             self.send_json(500, {
                 "success": False,
-                "error": "Audio extraction failed.",
-                "suggestion": (
-                    "Check FFmpeg availability, deployment logs, "
-                    "execution limits, and whether the video is accessible."
-                )
+                "error": "Audio download or conversion failed",
+                "details": str(error)[:500]
             })
 
         finally:
@@ -135,7 +143,10 @@ class handler(BaseHTTPRequestHandler):
         body = json.dumps(data).encode("utf-8")
 
         self.send_response(status)
-        self.send_header("Content-Type", "application/json")
+        self.send_header(
+            "Content-Type",
+            "application/json; charset=utf-8"
+        )
         self.send_header("Cache-Control", "no-store")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
