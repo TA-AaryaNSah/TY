@@ -1,17 +1,24 @@
 import os
 import re
 import json
+import base64
 import shutil
 import tempfile
 import urllib.parse
 
 from flask import Flask, request, jsonify, send_file
 import yt_dlp
+import imageio_ffmpeg
 
 app = Flask(__name__)
 
 MAX_DURATION = int(os.environ.get("MAX_DURATION", "1800"))
-FFMPEG_PATH = shutil.which("ffmpeg")
+
+# Find FFmpeg using PATH first, then imageio-ffmpeg.
+try:
+    FFMPEG_PATH = shutil.which("ffmpeg") or imageio_ffmpeg.get_ffmpeg_exe()
+except Exception:
+    FFMPEG_PATH = shutil.which("ffmpeg")
 
 
 def validate_youtube_url(url):
@@ -19,6 +26,7 @@ def validate_youtube_url(url):
         raise ValueError("Missing required parameter: url")
 
     parsed = urllib.parse.urlparse(url)
+    hostname = (parsed.hostname or "").lower()
 
     allowed_hosts = {
         "youtube.com",
@@ -32,13 +40,13 @@ def validate_youtube_url(url):
     if parsed.scheme not in ("http", "https"):
         raise ValueError("Only HTTP/HTTPS URLs are supported")
 
-    if (parsed.hostname or "").lower() not in allowed_hosts:
+    if hostname not in allowed_hosts:
         raise ValueError("Only YouTube URLs are supported")
 
     return url
 
 
-def get_ydl_options():
+def create_ydl_options():
     options = {
         "quiet": True,
         "no_warnings": True,
@@ -46,44 +54,65 @@ def get_ydl_options():
         "socket_timeout": 20,
     }
 
-    # Optional: a Netscape-format cookie file supplied as
-    # Base64 through the YOUTUBE_COOKIES_B64 environment variable.
+    if FFMPEG_PATH:
+        options["ffmpeg_location"] = FFMPEG_PATH
+
+    # Optional Base64-encoded Netscape cookies supplied through
+    # the YOUTUBE_COOKIES_B64 environment variable.
     cookies_b64 = os.environ.get("YOUTUBE_COOKIES_B64", "").strip()
 
     if cookies_b64:
-        import base64
-
-        cookie_data = base64.b64decode(cookies_b64, validate=True)
-
-        # Use a temporary writable file instead of /var/task.
-        cookie_file = tempfile.NamedTemporaryFile(
-            mode="wb",
-            suffix=".txt",
-            prefix="yt-cookies-",
-            dir="/tmp",
-            delete=False,
-        )
+        cookie_path = None
 
         try:
-            cookie_file.write(cookie_data)
-            cookie_file.close()
-            options["cookiefile"] = cookie_file.name
-        except Exception:
-            cookie_file.close()
-            try:
-                os.unlink(cookie_file.name)
-            except OSError:
-                pass
-            raise
+            cookie_data = base64.b64decode(
+                cookies_b64,
+                validate=True
+            )
 
-    if FFMPEG_PATH:
-        options["ffmpeg_location"] = FFMPEG_PATH
+            # Basic format validation; do not log cookie contents.
+            cookie_text = cookie_data.decode("utf-8-sig")
+
+            if "Netscape HTTP Cookie File" not in cookie_text[:200]:
+                raise ValueError(
+                    "Cookies must be in Netscape HTTP Cookie File format"
+                )
+
+            with tempfile.NamedTemporaryFile(
+                mode="wb",
+                suffix=".txt",
+                prefix="yt-cookies-",
+                dir="/tmp",
+                delete=False,
+            ) as cookie_file:
+                cookie_file.write(cookie_data)
+                cookie_path = cookie_file.name
+
+            options["cookiefile"] = cookie_path
+
+        except Exception:
+            if cookie_path:
+                try:
+                    os.unlink(cookie_path)
+                except OSError:
+                    pass
+            raise
 
     return options
 
 
-def extract_info(url):
-    options = get_ydl_options()
+def cleanup_cookie(options):
+    cookie_path = options.get("cookiefile")
+
+    if cookie_path:
+        try:
+            os.unlink(cookie_path)
+        except OSError:
+            pass
+
+
+def extract_video_info(url):
+    options = create_ydl_options()
     options["skip_download"] = True
 
     try:
@@ -92,25 +121,23 @@ def extract_info(url):
 
         duration = info.get("duration") or 0
 
-        if MAX_DURATION and duration > MAX_DURATION:
+        if MAX_DURATION > 0 and duration > MAX_DURATION:
             raise ValueError(
-                f"Video is too long. Maximum duration: {MAX_DURATION} seconds"
+                f"Video exceeds the maximum duration of {MAX_DURATION} seconds"
             )
 
         return {
-            "title": info.get("title", "YouTube audio"),
+            "id": info.get("id"),
+            "title": info.get("title"),
             "duration": duration,
             "thumbnail": info.get("thumbnail"),
+            "uploader": info.get("uploader"),
             "webpage_url": info.get("webpage_url", url),
+            "extractor": info.get("extractor"),
         }
 
     finally:
-        cookie_path = options.get("cookiefile")
-        if cookie_path:
-            try:
-                os.unlink(cookie_path)
-            except OSError:
-                pass
+        cleanup_cookie(options)
 
 
 @app.route("/", methods=["GET"])
@@ -118,6 +145,7 @@ def home():
     return jsonify({
         "success": True,
         "name": "YouTube Media API",
+        "version": "2.0",
         "endpoints": {
             "info": "/api/info?url=YOUTUBE_URL",
             "mp3": "/api?url=YOUTUBE_URL&quality=192",
@@ -128,52 +156,70 @@ def home():
 
 @app.route("/api/healthz", methods=["GET"])
 def health():
-    return jsonify({"success": True, "status": "ok"})
+    return jsonify({
+        "success": True,
+        "status": "ok",
+        "ffmpeg_available": bool(FFMPEG_PATH),
+    })
 
 
 @app.route("/api/info", methods=["GET"])
 def video_info():
     try:
         url = validate_youtube_url(request.args.get("url", ""))
-        info = extract_info(url)
+        info = extract_video_info(url)
 
         return jsonify({
             "success": True,
             "data": info,
         })
 
-    except Exception as exc:
+    except ValueError as exc:
         return jsonify({
             "success": False,
             "error": str(exc),
         }), 400
 
+    except Exception as exc:
+        return jsonify({
+            "success": False,
+            "error": "Unable to retrieve video information",
+            "details": str(exc)[:500],
+        }), 500
+
 
 @app.route("/api", methods=["GET"])
 def download_mp3():
     temp_dir = None
-    options = None
+    options = {}
 
     try:
         url = validate_youtube_url(request.args.get("url", ""))
 
         quality = request.args.get("quality", "192")
 
-        if quality not in {"64", "128", "192", "320"}:
+        if quality not in {"64", "128", "192", "256", "320"}:
             return jsonify({
                 "success": False,
-                "error": "quality must be 64, 128, 192, or 320",
+                "error": "quality must be 64, 128, 192, 256, or 320",
             }), 400
 
-        if not FFMPEG_PATH:
+        if not FFMPEG_PATH or not os.path.isfile(FFMPEG_PATH):
             return jsonify({
                 "success": False,
-                "error": "FFmpeg is not available in this deployment",
+                "error": "FFmpeg executable is unavailable",
+                "details": (
+                    "Check imageio-ffmpeg installation and deployment logs."
+                ),
             }), 500
 
-        temp_dir = tempfile.mkdtemp(prefix="youtube-", dir="/tmp")
+        temp_dir = tempfile.mkdtemp(
+            prefix="youtube-audio-",
+            dir="/tmp",
+        )
 
-        options = get_ydl_options()
+        options = create_ydl_options()
+
         options.update({
             "format": "bestaudio/best",
             "outtmpl": os.path.join(temp_dir, "%(id)s.%(ext)s"),
@@ -192,19 +238,21 @@ def download_mp3():
         output_file = os.path.join(temp_dir, f"{video_id}.mp3")
 
         if not os.path.isfile(output_file):
-            candidates = [
-                os.path.join(temp_dir, name)
-                for name in os.listdir(temp_dir)
-                if name.lower().endswith(".mp3")
+            mp3_files = [
+                os.path.join(temp_dir, filename)
+                for filename in os.listdir(temp_dir)
+                if filename.lower().endswith(".mp3")
             ]
 
-            if not candidates:
-                raise RuntimeError("MP3 conversion did not produce an output file")
+            if not mp3_files:
+                raise RuntimeError(
+                    "MP3 conversion did not produce an output file"
+                )
 
-            output_file = candidates[0]
+            output_file = mp3_files[0]
 
-        title = info.get("title", "audio")
-        safe_title = re.sub(r'[^\w .-]', "", title).strip()[:100]
+        title = info.get("title") or "audio"
+        safe_title = re.sub(r"[^\w .-]", "", title).strip()[:100]
         safe_title = safe_title or "audio"
 
         response = send_file(
@@ -215,36 +263,35 @@ def download_mp3():
             conditional=False,
         )
 
-        # Cleanup happens when the response is closed.
-        @response.call_on_close
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+
         def cleanup():
             if temp_dir:
                 shutil.rmtree(temp_dir, ignore_errors=True)
 
-            if options:
-                cookie_path = options.get("cookiefile")
-                if cookie_path:
-                    try:
-                        os.unlink(cookie_path)
-                    except OSError:
-                        pass
+            cleanup_cookie(options)
 
-        response.headers["Cache-Control"] = "no-store"
-        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.call_on_close(cleanup)
 
         return response
+
+    except ValueError as exc:
+        if temp_dir:
+            shutil.rmtree(temp_dir, ignore_errors=True)
+
+        cleanup_cookie(options)
+
+        return jsonify({
+            "success": False,
+            "error": str(exc),
+        }), 400
 
     except Exception as exc:
         if temp_dir:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
-        if options:
-            cookie_path = options.get("cookiefile")
-            if cookie_path:
-                try:
-                    os.unlink(cookie_path)
-                except OSError:
-                    pass
+        cleanup_cookie(options)
 
         return jsonify({
             "success": False,
@@ -253,5 +300,5 @@ def download_mp3():
         }), 500
 
 
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=10000)
+# Vercel imports this module and uses the Flask WSGI application.
+# Do not start app.run() in a serverless deployment.
