@@ -3,198 +3,255 @@ import re
 import json
 import shutil
 import tempfile
-from urllib.parse import urlparse, parse_qs
-from http.server import BaseHTTPRequestHandler
+import urllib.parse
 
+from flask import Flask, request, jsonify, send_file
 import yt_dlp
-import imageio_ffmpeg
 
+app = Flask(__name__)
 
-# --------------------------------------------------
-# CONFIGURATION
-# --------------------------------------------------
+MAX_DURATION = int(os.environ.get("MAX_DURATION", "1800"))
+FFMPEG_PATH = shutil.which("ffmpeg")
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-COOKIES_FILE = os.path.join(BASE_DIR, "cookies.txt")
-
-
-# --------------------------------------------------
-# YOUTUBE URL VALIDATION
-# --------------------------------------------------
 
 def validate_youtube_url(url):
-    try:
-        parsed = urlparse(url)
-        host = (parsed.hostname or "").lower()
+    if not url:
+        raise ValueError("Missing required parameter: url")
 
-        if host in (
-            "youtube.com",
-            "www.youtube.com",
-            "m.youtube.com",
-        ):
-            video_id = parse_qs(parsed.query).get("v", [""])[0]
+    parsed = urllib.parse.urlparse(url)
 
-        elif host == "youtu.be":
-            video_id = parsed.path.strip("/")
+    allowed_hosts = {
+        "youtube.com",
+        "www.youtube.com",
+        "m.youtube.com",
+        "music.youtube.com",
+        "youtu.be",
+        "www.youtu.be",
+    }
 
-        else:
-            return None
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError("Only HTTP/HTTPS URLs are supported")
 
-        if re.fullmatch(r"[A-Za-z0-9_-]{11}", video_id):
-            return video_id
+    if (parsed.hostname or "").lower() not in allowed_hosts:
+        raise ValueError("Only YouTube URLs are supported")
 
-        return None
-
-    except Exception:
-        return None
+    return url
 
 
-# --------------------------------------------------
-# API HANDLER
-# --------------------------------------------------
+def get_ydl_options():
+    options = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "socket_timeout": 20,
+    }
 
-class handler(BaseHTTPRequestHandler):
+    # Optional: a Netscape-format cookie file supplied as
+    # Base64 through the YOUTUBE_COOKIES_B64 environment variable.
+    cookies_b64 = os.environ.get("YOUTUBE_COOKIES_B64", "").strip()
 
-    def do_GET(self):
-        params = parse_qs(urlparse(self.path).query)
-        url = params.get("url", [""])[0].strip()
+    if cookies_b64:
+        import base64
 
-        # Validate request
-        if not url:
-            return self.send_json(400, {
-                "success": False,
-                "error": "Missing URL parameter",
-                "usage": "/api?url=YOUTUBE_URL"
-            })
+        cookie_data = base64.b64decode(cookies_b64, validate=True)
 
-        video_id = validate_youtube_url(url)
-
-        if not video_id:
-            return self.send_json(400, {
-                "success": False,
-                "error": "Invalid YouTube URL"
-            })
-
-        temp_dir = tempfile.mkdtemp(prefix="ytmp3_")
+        # Use a temporary writable file instead of /var/task.
+        cookie_file = tempfile.NamedTemporaryFile(
+            mode="wb",
+            suffix=".txt",
+            prefix="yt-cookies-",
+            dir="/tmp",
+            delete=False,
+        )
 
         try:
-            # Locate FFmpeg
-            ffmpeg_path = imageio_ffmpeg.get_ffmpeg_exe()
+            cookie_file.write(cookie_data)
+            cookie_file.close()
+            options["cookiefile"] = cookie_file.name
+        except Exception:
+            cookie_file.close()
+            try:
+                os.unlink(cookie_file.name)
+            except OSError:
+                pass
+            raise
 
-            # Output file
-            output_template = os.path.join(
-                temp_dir,
-                "audio.%(ext)s"
+    if FFMPEG_PATH:
+        options["ffmpeg_location"] = FFMPEG_PATH
+
+    return options
+
+
+def extract_info(url):
+    options = get_ydl_options()
+    options["skip_download"] = True
+
+    try:
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(url, download=False)
+
+        duration = info.get("duration") or 0
+
+        if MAX_DURATION and duration > MAX_DURATION:
+            raise ValueError(
+                f"Video is too long. Maximum duration: {MAX_DURATION} seconds"
             )
 
-            # yt-dlp options
-            options = {
-                "format": "bestaudio/best",
-                "outtmpl": output_template,
-                "noplaylist": True,
-                "quiet": True,
-                "no_warnings": True,
-                "socket_timeout": 20,
-                "retries": 2,
-                "ffmpeg_location": ffmpeg_path,
+        return {
+            "title": info.get("title", "YouTube audio"),
+            "duration": duration,
+            "thumbnail": info.get("thumbnail"),
+            "webpage_url": info.get("webpage_url", url),
+        }
 
-                # Use cookies only if the file exists.
-                "cookiefile": (
-                    COOKIES_FILE
-                    if os.path.isfile(COOKIES_FILE)
-                    else None
-                ),
+    finally:
+        cookie_path = options.get("cookiefile")
+        if cookie_path:
+            try:
+                os.unlink(cookie_path)
+            except OSError:
+                pass
 
-                # Convert audio to MP3.
-                "postprocessors": [
-                    {
-                        "key": "FFmpegExtractAudio",
-                        "preferredcodec": "mp3",
-                        "preferredquality": "192"
-                    }
-                ]
-            }
 
-            # Remove the optional setting if no cookies exist.
-            if options["cookiefile"] is None:
-                options.pop("cookiefile")
+@app.route("/", methods=["GET"])
+def home():
+    return jsonify({
+        "success": True,
+        "name": "YouTube Media API",
+        "endpoints": {
+            "info": "/api/info?url=YOUTUBE_URL",
+            "mp3": "/api?url=YOUTUBE_URL&quality=192",
+            "health": "/api/healthz",
+        },
+    })
 
-            # Download and convert.
-            with yt_dlp.YoutubeDL(options) as downloader:
-                downloader.download([url])
 
-            mp3_path = os.path.join(temp_dir, "audio.mp3")
+@app.route("/api/healthz", methods=["GET"])
+def health():
+    return jsonify({"success": True, "status": "ok"})
 
-            if not os.path.isfile(mp3_path):
-                return self.send_json(500, {
-                    "success": False,
-                    "error": "MP3 file was not generated"
-                })
 
-            file_size = os.path.getsize(mp3_path)
+@app.route("/api/info", methods=["GET"])
+def video_info():
+    try:
+        url = validate_youtube_url(request.args.get("url", ""))
+        info = extract_info(url)
 
-            # Vercel responses have platform-specific limits.
-            # This is an application-level safeguard.
-            max_size = 4 * 1024 * 1024
+        return jsonify({
+            "success": True,
+            "data": info,
+        })
 
-            if file_size > max_size:
-                return self.send_json(413, {
-                    "success": False,
-                    "error": "MP3 exceeds the configured response limit",
-                    "file_size_bytes": file_size,
-                    "message": (
-                        "Use a compatible streaming or storage service "
-                        "for larger audio files."
-                    )
-                })
+    except Exception as exc:
+        return jsonify({
+            "success": False,
+            "error": str(exc),
+        }), 400
 
-            # Read the converted MP3.
-            with open(mp3_path, "rb") as audio_file:
-                audio_data = audio_file.read()
 
-            # Return an automatic download response.
-            self.send_response(200)
-            self.send_header("Content-Type", "audio/mpeg")
-            self.send_header(
-                "Content-Disposition",
-                'attachment; filename="audio.mp3"'
-            )
-            self.send_header(
-                "Content-Length",
-                str(len(audio_data))
-            )
-            self.send_header("Cache-Control", "no-store")
-            self.end_headers()
+@app.route("/api", methods=["GET"])
+def download_mp3():
+    temp_dir = None
+    options = None
 
-            self.wfile.write(audio_data)
+    try:
+        url = validate_youtube_url(request.args.get("url", ""))
 
-        except Exception as error:
-            print("Audio processing error:", repr(error))
+        quality = request.args.get("quality", "192")
 
-            self.send_json(500, {
+        if quality not in {"64", "128", "192", "320"}:
+            return jsonify({
                 "success": False,
-                "error": "Audio download or conversion failed",
-                "details": str(error)[:500]
-            })
+                "error": "quality must be 64, 128, 192, or 320",
+            }), 400
 
-        finally:
-            # Delete temporary files after processing.
+        if not FFMPEG_PATH:
+            return jsonify({
+                "success": False,
+                "error": "FFmpeg is not available in this deployment",
+            }), 500
+
+        temp_dir = tempfile.mkdtemp(prefix="youtube-", dir="/tmp")
+
+        options = get_ydl_options()
+        options.update({
+            "format": "bestaudio/best",
+            "outtmpl": os.path.join(temp_dir, "%(id)s.%(ext)s"),
+            "noplaylist": True,
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": quality,
+            }],
+        })
+
+        with yt_dlp.YoutubeDL(options) as ydl:
+            info = ydl.extract_info(url, download=True)
+
+        video_id = info.get("id", "")
+        output_file = os.path.join(temp_dir, f"{video_id}.mp3")
+
+        if not os.path.isfile(output_file):
+            candidates = [
+                os.path.join(temp_dir, name)
+                for name in os.listdir(temp_dir)
+                if name.lower().endswith(".mp3")
+            ]
+
+            if not candidates:
+                raise RuntimeError("MP3 conversion did not produce an output file")
+
+            output_file = candidates[0]
+
+        title = info.get("title", "audio")
+        safe_title = re.sub(r'[^\w .-]', "", title).strip()[:100]
+        safe_title = safe_title or "audio"
+
+        response = send_file(
+            output_file,
+            mimetype="audio/mpeg",
+            as_attachment=True,
+            download_name=f"{safe_title}.mp3",
+            conditional=False,
+        )
+
+        # Cleanup happens when the response is closed.
+        @response.call_on_close
+        def cleanup():
+            if temp_dir:
+                shutil.rmtree(temp_dir, ignore_errors=True)
+
+            if options:
+                cookie_path = options.get("cookiefile")
+                if cookie_path:
+                    try:
+                        os.unlink(cookie_path)
+                    except OSError:
+                        pass
+
+        response.headers["Cache-Control"] = "no-store"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+
+        return response
+
+    except Exception as exc:
+        if temp_dir:
             shutil.rmtree(temp_dir, ignore_errors=True)
 
-    # --------------------------------------------------
-    # JSON RESPONSE
-    # --------------------------------------------------
+        if options:
+            cookie_path = options.get("cookiefile")
+            if cookie_path:
+                try:
+                    os.unlink(cookie_path)
+                except OSError:
+                    pass
 
-    def send_json(self, status, data):
-        body = json.dumps(data).encode("utf-8")
+        return jsonify({
+            "success": False,
+            "error": "Audio download or conversion failed",
+            "details": str(exc)[:500],
+        }), 500
 
-        self.send_response(status)
-        self.send_header(
-            "Content-Type",
-            "application/json; charset=utf-8"
-        )
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
 
-        self.wfile.write(body)
+if __name__ == "__main__":
+    app.run(host="0.0.0.0", port=10000)
